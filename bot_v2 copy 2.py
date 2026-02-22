@@ -1,6 +1,5 @@
 import os
 import json
-import asyncio
 import libsql
 from datetime import datetime
 from dotenv import load_dotenv
@@ -1111,10 +1110,4 @@ def main():
         app.run_polling()
 
 if __name__ == '__main__':
-    # Python 3.14+ removed implicit event loop creation.
-    # Ensure one exists before python-telegram-bot tries to use it.
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
     main()
