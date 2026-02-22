@@ -6,4 +6,5 @@ google-auth-oauthlib
 google-api-python-client
 google-auth
 libsql
-asyncio
+starlette
+uvicorn[standard]

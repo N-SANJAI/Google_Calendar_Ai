@@ -1101,20 +1101,59 @@ def main():
 
     if WEBHOOK_URL:
         print(f"Starting webhook on port {PORT}...")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=WEBHOOK_URL
-        )
+
+        async def main_async():
+            # Manually initialise the PTB application
+            async with app:
+                await app.start()
+
+                # Set webhook with Telegram
+                await app.bot.set_webhook(url=WEBHOOK_URL + "/webhook")
+
+                # Build a small Starlette app that serves health checks
+                # AND forwards Telegram updates to PTB
+                from starlette.applications import Starlette
+                from starlette.responses import PlainTextResponse, Response
+                from starlette.requests import Request
+                from starlette.routing import Route
+                import uvicorn
+
+                async def health(request: Request):
+                    return PlainTextResponse("OK")
+
+                async def telegram_webhook(request: Request):
+                    """Receive Telegram updates and feed them to PTB."""
+                    data = await request.json()
+                    update = Update.de_json(data=data, bot=app.bot)
+                    await app.process_update(update)
+                    return Response(status_code=200)
+
+                starlette_app = Starlette(
+                    routes=[
+                        Route("/", health),
+                        Route("/health", health),
+                        Route("/webhook", telegram_webhook, methods=["POST"]),
+                    ]
+                )
+
+                webserver = uvicorn.Server(
+                    config=uvicorn.Config(
+                        app=starlette_app,
+                        host="0.0.0.0",
+                        port=PORT,
+                        log_level="info",
+                    )
+                )
+
+                # This blocks until the server shuts down
+                await webserver.serve()
+
+                await app.stop()
+
+        asyncio.run(main_async())
     else:
         print("Bot is fully operational. Awaiting your commands (Local Polling).")
         app.run_polling()
 
 if __name__ == '__main__':
-    # Python 3.14+ removed implicit event loop creation.
-    # Ensure one exists before python-telegram-bot tries to use it.
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
     main()
