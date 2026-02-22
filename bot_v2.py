@@ -1094,9 +1094,20 @@ def main():
     app.add_handler(CommandHandler("model", model_command, filters=user_filter))
     app.add_handler(CallbackQueryHandler(model_button_handler, pattern="^mdl_"))
 
-    print("Bot is fully operational. Awaiting your commands.")
-    app.run_polling()
+    # --- Webhook vs Polling Logic ---
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+    PORT = int(os.getenv("PORT", "10000")) 
 
+    if WEBHOOK_URL:
+        print(f"Starting webhook on port {PORT}...")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=WEBHOOK_URL
+        )
+    else:
+        print("Bot is fully operational. Awaiting your commands (Local Polling).")
+        app.run_polling()
 
 if __name__ == '__main__':
     main()
