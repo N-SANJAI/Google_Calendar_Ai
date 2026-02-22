@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import libsql
 from datetime import datetime
 from dotenv import load_dotenv
@@ -315,6 +316,20 @@ async def generate_text_with_fallback(
 # Google Calendar helpers
 # ============================================================
 def get_calendar_service():
+    # 1. Decode Base64 environment variables back into physical files
+    creds_b64 = os.getenv("CREDENTIALS_B64")
+    token_b64 = os.getenv("TOKEN_B64")
+
+    # Only create the file if the env var exists AND the file doesn't already exist
+    if creds_b64 and not os.path.exists('credentials.json'):
+        with open('credentials.json', 'wb') as f:
+            f.write(base64.b64decode(creds_b64))
+
+    if token_b64 and not os.path.exists('token.json'):
+        with open('token.json', 'wb') as f:
+            f.write(base64.b64decode(token_b64))
+
+    # 2. Proceed with standard Google Calendar authentication
     creds = None
     if os.path.exists('token.json'):
         creds = Credentials.from_authorized_user_file('token.json', SCOPES)
@@ -326,6 +341,7 @@ def get_calendar_service():
             creds = flow.run_local_server(port=0)
         with open('token.json', 'w') as token:
             token.write(creds.to_json())
+            
     return build('calendar', 'v3', credentials=creds)
 
 
@@ -1094,9 +1110,20 @@ def main():
     app.add_handler(CommandHandler("model", model_command, filters=user_filter))
     app.add_handler(CallbackQueryHandler(model_button_handler, pattern="^mdl_"))
 
-    print("Bot is fully operational. Awaiting your commands.")
-    app.run_polling()
+    # --- Webhook vs Polling Logic ---
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+    PORT = int(os.getenv("PORT", "10000")) # Cloud providers automatically inject a PORT
 
+    if WEBHOOK_URL:
+        print(f"Starting webhook on port {PORT}...")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=WEBHOOK_URL
+        )
+    else:
+        print("Bot is fully operational. Awaiting your commands (Local Polling).")
+        app.run_polling()
 
 if __name__ == '__main__':
     main()
