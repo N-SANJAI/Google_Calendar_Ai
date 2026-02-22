@@ -5,5 +5,4 @@ pydantic
 google-auth-oauthlib
 google-api-python-client
 google-auth
-libsql-experimental
 libsql
