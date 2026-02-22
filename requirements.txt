@@ -1,0 +1,7 @@
+python-telegram-bot
+google-genai
+libsql
+pydantic
+google-auth-oauthlib
+google-api-python-client
+python-dotenv
