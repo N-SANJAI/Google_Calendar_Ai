@@ -85,9 +85,6 @@ def get_sg_time_str() -> str:
     return get_sg_now().strftime("%A, %d %B %Y at %I:%M %p")
 
 
-def get_sg_iso() -> str:
-    return get_sg_now().isoformat()
-
 
 # ============================================================
 # Config Management (Turso)
@@ -313,7 +310,9 @@ async def generate_with_fallback(prompt: str, status_message=None, use_schema: b
                 continue
             raise
 
-    raise last_error
+    if last_error:
+        raise last_error
+    raise RuntimeError("Model chain is empty or all models failed silently.")
 
 
 async def generate_text_with_fallback(prompt: str, status_message=None, model_chain=None):
@@ -344,7 +343,9 @@ async def generate_text_with_fallback(prompt: str, status_message=None, model_ch
                 continue
             raise
 
-    raise last_error
+    if last_error:
+        raise last_error
+    raise RuntimeError("Model chain is empty or all models failed silently.")
 
 
 async def generate_from_image_with_fallback(image_bytes: bytes, prompt: str, status_message=None):
@@ -389,11 +390,9 @@ async def generate_from_image_with_fallback(image_bytes: bytes, prompt: str, sta
                 continue
             raise
 
-    raise last_error
-
-
-# ============================================================
-# Google Calendar helpers
+    if last_error:
+        raise last_error
+    raise RuntimeError("Vision model chain is empty or all models failed silently.")
 # ============================================================
 def get_calendar_service():
     creds = None
@@ -548,7 +547,7 @@ def format_events_for_display(events: list, search_hint: str = "", show_gcal_lin
                 time_range = dt.strftime('%I:%M %p').lstrip('0') if dt else "All day"
             location = ev.get('location', '')
             loc_str = f"\n    📍 _{location}_" if location else ""
-            lines.append(f"  • [*{title}*]({event_link})\n    🕐 {time_range}{loc_str}")
+            lines.append(f"  • [{title}]({event_link})\n    🕐 {time_range}{loc_str}")
 
         lines.append("")
 
@@ -576,7 +575,10 @@ async def handle_delete_intent(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         hint = intent_data.get("search_hint", "")
-        events = fetch_events(intent_data["time_min"], intent_data["time_max"], search_query=hint)
+        now = get_sg_now()
+        time_min = intent_data.get("time_min", now.isoformat())
+        time_max = intent_data.get("time_max", (now + timedelta(days=180)).isoformat())
+        events = fetch_events(time_min, time_max, search_query=hint)
 
         if not events:
             await status.edit_text(
@@ -613,7 +615,7 @@ async def handle_delete_intent(update: Update, context: ContextTypes.DEFAULT_TYP
         buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="del_no")])
 
         await status.edit_text(
-            f"Found {len(matched)} matching events. Which one do you want to delete?",
+            f"Found {len(events)} matching events. Which one do you want to delete?",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return UPDATE_REVIEW
@@ -825,17 +827,22 @@ async def start_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if intent == "query":
         try:
             hint = intent_data.get("search_hint", "")
-            # Pass hint to the API's native q= search — no client-side filtering needed
-            events = fetch_events(intent_data["time_min"], intent_data["time_max"], search_query=hint)
+            now = get_sg_now()
+            time_min = intent_data.get("time_min", now.isoformat())
+            time_max = intent_data.get("time_max", (now + timedelta(days=180)).isoformat())
+            events = fetch_events(time_min, time_max, search_query=hint)
             reply = format_events_for_display(events, search_hint=hint, show_gcal_link=True)
-            await status_message.edit_text(reply, parse_mode='Markdown', disable_web_page_preview=False)
+            await status_message.edit_text(reply, parse_mode='Markdown', disable_web_page_preview=True)
         except Exception as e:
             await status_message.edit_text(f"❌ Could not fetch calendar: {e}")
         return ConversationHandler.END
 
     # --- Delete flow (by description, not reply) ---
     if intent == "delete":
-        await status_message.delete()
+        try:
+            await status_message.delete()
+        except Exception:
+            pass  # Not critical if delete fails
         return await handle_delete_intent(update, context, intent_data)
 
     # --- Create flow ---
@@ -872,8 +879,11 @@ async def start_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_draft_menu(message_obj, context):
     event_data = context.user_data['draft_event']
-    start_display = format_time_for_user(event_data['start_time'])
-    end_display = format_time_for_user(event_data['end_time'])
+    # Use .get() with fallbacks so a malformed AI response never crashes the menu
+    raw_start = event_data.get('start_time', '')
+    raw_end = event_data.get('end_time', '')
+    start_display = format_time_for_user(raw_start) if raw_start else '⚠️ Not set'
+    end_display = format_time_for_user(raw_end) if raw_end else '⚠️ Not set'
 
     keyboard = [
         [InlineKeyboardButton("✅ Confirm & Add", callback_data="act_confirm")],
