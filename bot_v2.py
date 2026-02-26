@@ -410,15 +410,6 @@ def get_calendar_service():
     return build('calendar', 'v3', credentials=creds)
 
 
-def gcal_day_link(date: datetime.date) -> str:
-    """Return a direct Google Calendar link for a specific day."""
-    return f"{GCAL_URL}/day/{date.year}/{date.month}/{date.day}"
-
-
-def gcal_week_link(date: datetime.date) -> str:
-    """Return a direct Google Calendar link for the week containing the given date."""
-    return f"{GCAL_URL}/week/{date.year}/{date.month}/{date.day}"
-
 
 # ============================================================
 # Intent Classification (Gemma-first)
@@ -434,7 +425,7 @@ async def classify_intent(user_text: str) -> dict:
     """
     current_time = get_sg_time_str()
     now = get_sg_now()
-    in_30d = (now + timedelta(days=30)).isoformat()
+    in_6m = (now + timedelta(days=180)).isoformat()
 
     prompt = (
         f"Today is {current_time} (Singapore Time, UTC+8).\n"
@@ -448,20 +439,24 @@ async def classify_intent(user_text: str) -> dict:
         f"User message: \"{user_text}\"\n\n"
         f"JSON format rules:\n"
         f"- For 'query': include time_min, time_max (ISO 8601 +08:00) and search_hint "
-        f"  (key word or phrase from the message, e.g. 'badminton'). "
-        f"  If no specific date is mentioned, set time_min = now and time_max = 30 days from now "
-        f"  ({in_30d}).\n"
+        f"  (keyword or short phrase extracted from the message, e.g. 'badminton'). "
+        f"  IMPORTANT: If no specific date is mentioned (open-ended like 'when is X'), "
+        f"  set time_min = now and time_max = 6 months from now ({in_6m}) so future events are found. "
+        f"  Only use a narrow window if the user specifies a date (e.g. 'tomorrow', 'this week').\n"
         f"- For 'create': just {{\"intent\": \"create\"}}\n"
-        f"- For 'delete': include search_hint, time_min, time_max covering the relevant period. "
-        f"  If no specific date, use now to +30 days.\n\n"
+        f"- For 'delete': include search_hint, time_min, time_max. "
+        f"  If no specific date, use now to +6 months.\n\n"
         f"Examples:\n"
         f"  'when is my badminton' → "
         f"  {{\"intent\":\"query\",\"time_min\":\"{now.isoformat()}\","
-        f"\"time_max\":\"{in_30d}\",\"search_hint\":\"badminton\"}}\n"
+        f"\"time_max\":\"{in_6m}\",\"search_hint\":\"badminton\"}}\n"
+        f"  'what do I have tmr' → "
+        f"  {{\"intent\":\"query\",\"time_min\":\"<start of tomorrow>\","
+        f"\"time_max\":\"<end of tomorrow>\",\"search_hint\":\"\"}}\n"
         f"  'add badminton tmr 5pm 2h' → {{\"intent\":\"create\"}}\n"
         f"  'delete my badminton on Friday' → "
         f"  {{\"intent\":\"delete\",\"search_hint\":\"badminton\","
-        f"\"time_min\":\"{now.isoformat()}\",\"time_max\":\"{in_30d}\"}}\n\n"
+        f"\"time_min\":\"{now.isoformat()}\",\"time_max\":\"{in_6m}\"}}\n\n"
         f"Reply with ONLY the JSON object."
     )
 
@@ -478,37 +473,32 @@ async def classify_intent(user_text: str) -> dict:
 # ============================================================
 # Calendar Query helpers
 # ============================================================
-def fetch_events(time_min: str, time_max: str) -> list:
+def fetch_events(time_min: str, time_max: str, search_query: str = "") -> list:
+    """
+    Fetch events from Google Calendar.
+    If search_query is provided, uses the Calendar API's native full-text search (q=)
+    which searches across title, description, and location server-side.
+    This is more reliable than client-side filtering and works across any time window.
+    """
     service = get_calendar_service()
-    result = service.events().list(
+    params = dict(
         calendarId='primary',
         timeMin=time_min,
         timeMax=time_max,
         singleEvents=True,
         orderBy='startTime',
         maxResults=25,
-    ).execute()
+    )
+    if search_query:
+        params['q'] = search_query
+    result = service.events().list(**params).execute()
     return result.get('items', [])
-
-
-def find_events_matching(events: list, search_hint: str) -> list:
-    """Filter events by search hint (title, description, location)."""
-    if not search_hint:
-        return events
-    hint = search_hint.lower()
-    matched = [
-        e for e in events
-        if hint in e.get('summary', '').lower()
-        or hint in e.get('description', '').lower()
-        or hint in e.get('location', '').lower()
-    ]
-    return matched if matched else events  # fallback to all if no match
 
 
 def format_events_for_display(events: list, search_hint: str = "", show_gcal_link: bool = True) -> str:
     """
     Format events grouped by date.
-    Includes a Google Calendar link for easy navigation.
+    Each event links directly to that event in Google Calendar via its htmlLink.
     """
     if not events:
         hint_str = f" matching '{search_hint}'" if search_hint else ""
@@ -537,18 +527,16 @@ def format_events_for_display(events: list, search_hint: str = "", show_gcal_lin
     for date_key in sorted(k for k in grouped if k is not None):
         if date_key == today:
             label = "🔵 Today"
-            cal_link = gcal_day_link(date_key)
         elif date_key == tomorrow:
             label = "🟢 Tomorrow"
-            cal_link = gcal_day_link(date_key)
         else:
             label = date_key.strftime("📆 %A, %d %b")
-            cal_link = gcal_day_link(date_key)
 
-        lines.append(f"*{label}* — [view in calendar]({cal_link})")
+        lines.append(f"*{label}*")
 
         for dt, ev in grouped[date_key]:
             title = ev.get('summary', '(No title)')
+            event_link = ev.get('htmlLink', GCAL_URL)
             end_raw = ev['end'].get('dateTime', ev['end'].get('date', ''))
             try:
                 end_dt = datetime.fromisoformat(end_raw).astimezone(sg_tz)
@@ -560,7 +548,7 @@ def format_events_for_display(events: list, search_hint: str = "", show_gcal_lin
                 time_range = dt.strftime('%I:%M %p').lstrip('0') if dt else "All day"
             location = ev.get('location', '')
             loc_str = f"\n    📍 _{location}_" if location else ""
-            lines.append(f"  • *{title}*\n    🕐 {time_range}{loc_str}")
+            lines.append(f"  • [*{title}*]({event_link})\n    🕐 {time_range}{loc_str}")
 
         lines.append("")
 
@@ -568,7 +556,9 @@ def format_events_for_display(events: list, search_hint: str = "", show_gcal_lin
     if None in grouped:
         lines.append("*Unknown date*")
         for _, ev in grouped[None]:
-            lines.append(f"  • *{ev.get('summary', '(No title)')}*")
+            title = ev.get('summary', '(No title)')
+            event_link = ev.get('htmlLink', GCAL_URL)
+            lines.append(f"  • [{title}]({event_link})")
         lines.append("")
 
     if show_gcal_link:
@@ -585,18 +575,17 @@ async def handle_delete_intent(update: Update, context: ContextTypes.DEFAULT_TYP
     status = await update.message.reply_text("🔍 Searching for matching events...")
 
     try:
-        events = fetch_events(intent_data["time_min"], intent_data["time_max"])
         hint = intent_data.get("search_hint", "")
-        matched = find_events_matching(events, hint)
+        events = fetch_events(intent_data["time_min"], intent_data["time_max"], search_query=hint)
 
-        if not matched:
+        if not events:
             await status.edit_text(
                 f"📭 No events found matching '{hint}'. Nothing was deleted."
             )
             return ConversationHandler.END
 
-        if len(matched) == 1:
-            ev = matched[0]
+        if len(events) == 1:
+            ev = events[0]
             start_raw = ev['start'].get('dateTime', ev['start'].get('date', ''))
             start_display = format_time_for_user(start_raw)
             context.user_data['delete_event_id'] = ev['id']
@@ -615,8 +604,8 @@ async def handle_delete_intent(update: Update, context: ContextTypes.DEFAULT_TYP
 
         # Multiple matches — let the user pick
         buttons = []
-        context.user_data['delete_candidates'] = {ev['id']: ev for ev in matched[:8]}
-        for ev in matched[:8]:
+        context.user_data['delete_candidates'] = {ev['id']: ev for ev in events[:8]}
+        for ev in events[:8]:
             start_raw = ev['start'].get('dateTime', ev['start'].get('date', ''))
             start_display = format_time_for_user(start_raw)
             label = f"{ev.get('summary', '?')} · {start_display}"[:50]
@@ -835,12 +824,11 @@ async def start_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Query flow ---
     if intent == "query":
         try:
-            events = fetch_events(intent_data["time_min"], intent_data["time_max"])
             hint = intent_data.get("search_hint", "")
-            if hint:
-                events = find_events_matching(events, hint)
+            # Pass hint to the API's native q= search — no client-side filtering needed
+            events = fetch_events(intent_data["time_min"], intent_data["time_max"], search_query=hint)
             reply = format_events_for_display(events, search_hint=hint, show_gcal_link=True)
-            await status_message.edit_text(reply, parse_mode='Markdown', disable_web_page_preview=True)
+            await status_message.edit_text(reply, parse_mode='Markdown', disable_web_page_preview=False)
         except Exception as e:
             await status_message.edit_text(f"❌ Could not fetch calendar: {e}")
         return ConversationHandler.END
@@ -982,12 +970,6 @@ async def main_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             end_display = format_time_for_user(event_data['end_time'])
 
             # Deep link to the specific day in Google Calendar
-            try:
-                event_dt = datetime.fromisoformat(event_data['start_time'])
-                day_link = gcal_day_link(event_dt.date())
-            except Exception:
-                day_link = GCAL_URL
-
             success_msg = (
                 f"✅ *Event Successfully Added!*\n\n"
                 f"*Title:* {event_data['summary']}\n"
@@ -995,8 +977,7 @@ async def main_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"*Location:* {event_data.get('location') or 'N/A'}\n"
                 f"*Starts:* {start_display}\n"
                 f"*Ends:* {end_display}\n\n"
-                f"[🗓️ View event]({created.get('htmlLink')}) · "
-                f"[📅 View day]({day_link})\n\n"
+                f"[🗓️ View in Google Calendar]({created.get('htmlLink')})\n\n"
                 f"_💡 Reply to this message with 'delete' to remove it, or with new details to update it._"
             )
             await query.edit_message_text(
@@ -1236,12 +1217,6 @@ async def update_review_handler(update: Update, context: ContextTypes.DEFAULT_TY
             start_display = format_time_for_user(updated_data['start_time'])
             end_display = format_time_for_user(updated_data['end_time'])
 
-            try:
-                event_dt = datetime.fromisoformat(updated_data['start_time'])
-                day_link = gcal_day_link(event_dt.date())
-            except Exception:
-                day_link = GCAL_URL
-
             msg = (
                 f"✅ *Event Updated!*\n\n"
                 f"*Title:* {updated_data['summary']}\n"
@@ -1249,7 +1224,7 @@ async def update_review_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 f"*Location:* {updated_data.get('location') or 'N/A'}\n"
                 f"*Starts:* {start_display}\n"
                 f"*Ends:* {end_display}\n\n"
-                f"[🗓️ View event]({patched.get('htmlLink')}) · [📅 View day]({day_link})\n\n"
+                f"[🗓️ View in Google Calendar]({patched.get('htmlLink')})\n\n"
                 f"_💡 Reply to this message to update or delete it again._"
             )
             await query.edit_message_text(
