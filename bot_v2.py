@@ -2,7 +2,8 @@ import os
 import json
 import asyncio
 import libsql
-from datetime import datetime
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -50,7 +51,6 @@ COLOR_NAMES = {
     "9": "🫐 Blueberry", "10": "🌱 Basil", "11": "🍅 Tomato"
 }
 
-# Short labels for color picker buttons (2 per row)
 COLOR_SHORT = {
     "1": "🟣 Lavender", "2": "🌿 Sage", "3": "🍇 Grape", "4": "🦩 Flamingo",
     "5": "🍌 Banana", "6": "🍊 Tangerine", "7": "🦚 Peacock", "8": "⬛ Graphite",
@@ -59,10 +59,42 @@ COLOR_SHORT = {
 
 
 # ============================================================
+# Singapore Time (via timeapi.io — timezone-safe for Render)
+# ============================================================
+def get_sg_now() -> datetime:
+    """
+    Fetch current Singapore time from timeapi.io.
+    Falls back to local time + UTC+8 offset if the request fails.
+    """
+    try:
+        url = "https://timeapi.io/api/Time/current/zone?timeZone=Asia/Singapore"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        # data["dateTime"] is like "2026-02-26T12:12:46.1950398"
+        dt_str = data["dateTime"].split(".")[0]  # strip sub-seconds
+        sg_tz = timezone(timedelta(hours=8))
+        return datetime.fromisoformat(dt_str).replace(tzinfo=sg_tz)
+    except Exception as e:
+        print(f"Warning: timeapi.io failed ({e}), falling back to UTC+8 offset.")
+        sg_tz = timezone(timedelta(hours=8))
+        return datetime.now(tz=timezone.utc).astimezone(sg_tz)
+
+
+def get_sg_time_str() -> str:
+    """Return a human-readable Singapore time string for prompts."""
+    now = get_sg_now()
+    return now.strftime("%A, %d %B %Y at %I:%M %p")
+
+
+def get_sg_iso() -> str:
+    """Return current Singapore time as ISO 8601 string."""
+    return get_sg_now().isoformat()
+
+
+# ============================================================
 # Config Management (stored in Turso as key-value)
 # ============================================================
 def _get_db():
-    """Get a connection to Turso."""
     return libsql.connect(
         database=TURSO_DATABASE_URL,
         auth_token=TURSO_AUTH_TOKEN,
@@ -70,7 +102,6 @@ def _get_db():
 
 
 def _init_config_table():
-    """Create the config table if it doesn't exist."""
     conn = _get_db()
     conn.execute(
         'CREATE TABLE IF NOT EXISTS bot_config '
@@ -137,7 +168,6 @@ def init_db():
         '(message_id INTEGER PRIMARY KEY, google_event_id TEXT)'
     )
     conn.commit()
-    # Also ensure config table exists
     _init_config_table()
 
 
@@ -331,6 +361,82 @@ def get_calendar_service():
 
 
 # ============================================================
+# Intent Detection & Calendar Query
+# ============================================================
+QUERY_KEYWORDS = [
+    "what do i have", "what's on", "whats on", "do i have anything",
+    "show me", "list my", "any events", "schedule for", "agenda",
+    "what is scheduled", "am i free", "am i busy", "what time",
+    "remind me what", "tmr", "tomorrow", "today", "this week",
+    "next week", "upcoming", "calendar", "what's happening", "whats happening",
+]
+
+
+def looks_like_query(text: str) -> bool:
+    """Quick heuristic check before calling the LLM."""
+    lowered = text.lower()
+    return any(kw in lowered for kw in QUERY_KEYWORDS)
+
+
+async def classify_intent(user_text: str) -> dict:
+    """
+    Ask Gemini to classify the message intent and extract query parameters.
+    Returns dict: { "intent": "query"|"create", "time_min": "...", "time_max": "..." }
+    """
+    current_time = get_sg_time_str()
+    prompt = (
+        f"Today is {current_time} (Singapore Time, UTC+8).\n"
+        f"Classify the user's message as either a calendar QUERY (asking about existing events) "
+        f"or a calendar CREATE/UPDATE request (adding/editing an event).\n\n"
+        f"User message: \"{user_text}\"\n\n"
+        f"Respond with ONLY valid JSON like:\n"
+        f'{{ "intent": "query", "time_min": "YYYY-MM-DDTHH:MM:SS+08:00", "time_max": "YYYY-MM-DDTHH:MM:SS+08:00" }}\n'
+        f"or\n"
+        f'{{ "intent": "create" }}\n\n'
+        f"For queries, set time_min and time_max to cover the relevant period "
+        f"(e.g. for 'tomorrow' use start and end of tomorrow, for 'this week' use Mon–Sun). "
+        f"Always use UTC+8 offset in timestamps."
+    )
+    raw, _ = await generate_text_with_fallback(prompt)
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    return json.loads(raw)
+
+
+def fetch_events(time_min: str, time_max: str) -> list:
+    """Fetch events from Google Calendar between time_min and time_max."""
+    service = get_calendar_service()
+    result = service.events().list(
+        calendarId='primary',
+        timeMin=time_min,
+        timeMax=time_max,
+        singleEvents=True,
+        orderBy='startTime',
+        maxResults=20,
+    ).execute()
+    return result.get('items', [])
+
+
+def format_events_for_display(events: list) -> str:
+    if not events:
+        return "📭 No events found for that period."
+
+    lines = []
+    for ev in events:
+        start = ev['start'].get('dateTime', ev['start'].get('date', ''))
+        try:
+            start_display = format_time_for_user(start)
+        except Exception:
+            start_display = start
+        title = ev.get('summary', '(No title)')
+        location = ev.get('location', '')
+        loc_str = f"\n  📍 {location}" if location else ""
+        lines.append(f"• *{title}*\n  🕐 {start_display}{loc_str}")
+
+    return "\n\n".join(lines)
+
+
+# ============================================================
 # /model command — interactive model picker
 # ============================================================
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -406,6 +512,7 @@ async def model_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 HELP_TEXT = (
     "📖 *Available Commands*\n\n"
     "• *Send any text* — I'll extract event details and add them to Google Calendar.\n"
+    "• *Ask about your schedule* — e.g. 'what do I have tmr?', 'am I free this week?'\n"
     "• *Reply to a confirmed event* with new details — I'll update the event.\n"
     "• *Reply with* `delete` / `cancel` / `remove` — I'll delete the event.\n\n"
     "*Commands:*\n"
@@ -427,13 +534,33 @@ async def start_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.reply_to_message:
         return await handle_update_reply(update, context)
 
-    status_message = await update.message.reply_text("⏳ Extracting details...")
     user_text = update.message.text
+    status_message = await update.message.reply_text("⏳ Thinking...")
 
+    # --- Route: query vs. create ---
+    try:
+        if looks_like_query(user_text):
+            intent_data = await classify_intent(user_text)
+        else:
+            intent_data = {"intent": "create"}
+    except Exception as e:
+        print(f"Intent classification failed: {e}, defaulting to create.")
+        intent_data = {"intent": "create"}
+
+    if intent_data.get("intent") == "query":
+        try:
+            events = fetch_events(intent_data["time_min"], intent_data["time_max"])
+            reply = format_events_for_display(events)
+            await status_message.edit_text(reply, parse_mode='Markdown')
+        except Exception as e:
+            await status_message.edit_text(f"❌ Could not fetch calendar: {e}")
+        return ConversationHandler.END
+
+    # --- Original creation flow ---
     app_config = load_config()
     category_list = ", ".join(f"'{c}'" for c in app_config["colors"].keys())
+    current_time = get_sg_time_str()
 
-    current_time = datetime.now().strftime("%A, %d %B %Y at %I:%M %p")
     system_prompt = (
         f"Today's date and time is {current_time} (Singapore Time, UTC+8). "
         f"Use this context to accurately infer missing years, months, or relative days. "
@@ -634,7 +761,7 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if field in ('start_time', 'end_time'):
         status = await update.message.reply_text("⏳ Parsing time…")
         try:
-            current_time = datetime.now().strftime("%A, %d %B %Y at %I:%M %p")
+            current_time = get_sg_time_str()
             prompt = (
                 f"Today is {current_time} (Singapore Time, UTC+8). "
                 f"Convert this to ISO 8601 format (YYYY-MM-DDTHH:MM:SS+08:00): '{new_value}'. "
@@ -1097,21 +1224,16 @@ def main():
 
     # --- Webhook vs Polling Logic ---
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    PORT = int(os.getenv("PORT", "10000")) 
+    PORT = int(os.getenv("PORT", "10000"))
 
     if WEBHOOK_URL:
         print(f"Starting webhook on port {PORT}...")
 
         async def main_async():
-            # Manually initialise the PTB application
             async with app:
                 await app.start()
-
-                # Set webhook with Telegram
                 await app.bot.set_webhook(url=WEBHOOK_URL + "/webhook")
 
-                # Build a small Starlette app that serves health checks
-                # AND forwards Telegram updates to PTB
                 from starlette.applications import Starlette
                 from starlette.responses import PlainTextResponse, Response
                 from starlette.requests import Request
@@ -1122,7 +1244,6 @@ def main():
                     return PlainTextResponse("OK")
 
                 async def telegram_webhook(request: Request):
-                    """Receive Telegram updates and feed them to PTB."""
                     data = await request.json()
                     update = Update.de_json(data=data, bot=app.bot)
                     await app.process_update(update)
@@ -1145,15 +1266,14 @@ def main():
                     )
                 )
 
-                # This blocks until the server shuts down
                 await webserver.serve()
-
                 await app.stop()
 
         asyncio.run(main_async())
     else:
         print("Bot is fully operational. Awaiting your commands (Local Polling).")
         app.run_polling()
+
 
 if __name__ == '__main__':
     main()
