@@ -3,7 +3,9 @@ import json
 import asyncio
 import libsql
 import urllib.request
+import base64
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -57,21 +59,20 @@ COLOR_SHORT = {
     "9": "🫐 Blueberry", "10": "🌱 Basil", "11": "🍅 Tomato"
 }
 
+# Google Calendar base URL
+GCAL_URL = "https://calendar.google.com/calendar/r"
+
 
 # ============================================================
 # Singapore Time (via timeapi.io — timezone-safe for Render)
 # ============================================================
 def get_sg_now() -> datetime:
-    """
-    Fetch current Singapore time from timeapi.io.
-    Falls back to local time + UTC+8 offset if the request fails.
-    """
+    """Fetch current Singapore time from timeapi.io, fallback to UTC+8."""
     try:
         url = "https://timeapi.io/api/Time/current/zone?timeZone=Asia/Singapore"
         with urllib.request.urlopen(url, timeout=5) as resp:
             data = json.loads(resp.read().decode())
-        # data["dateTime"] is like "2026-02-26T12:12:46.1950398"
-        dt_str = data["dateTime"].split(".")[0]  # strip sub-seconds
+        dt_str = data["dateTime"].split(".")[0]
         sg_tz = timezone(timedelta(hours=8))
         return datetime.fromisoformat(dt_str).replace(tzinfo=sg_tz)
     except Exception as e:
@@ -81,18 +82,15 @@ def get_sg_now() -> datetime:
 
 
 def get_sg_time_str() -> str:
-    """Return a human-readable Singapore time string for prompts."""
-    now = get_sg_now()
-    return now.strftime("%A, %d %B %Y at %I:%M %p")
+    return get_sg_now().strftime("%A, %d %B %Y at %I:%M %p")
 
 
 def get_sg_iso() -> str:
-    """Return current Singapore time as ISO 8601 string."""
     return get_sg_now().isoformat()
 
 
 # ============================================================
-# Config Management (stored in Turso as key-value)
+# Config Management (Turso)
 # ============================================================
 def _get_db():
     return libsql.connect(
@@ -209,15 +207,34 @@ class CalendarEvent(BaseModel):
 
 
 # ============================================================
-# Model Fallback Chain
+# Model Chains
 # ============================================================
+
+# Full-featured chain (for event extraction, updates)
 MODEL_CHAIN = [
-    {"id": "gemini-2.5-flash",         "name": "Gemini 2.5 Flash",     "supports_schema": True},
-    {"id": "gemini-2.5-flash-lite",    "name": "Gemini 2.5 Flash Lite","supports_schema": True},
-    {"id": "gemini-3-flash-preview",   "name": "Gemini 3 Flash",       "supports_schema": True},
-    {"id": "gemma-3-4b-it",            "name": "Gemma 3 4B",           "supports_schema": False},
-    {"id": "gemma-3-27b-it",           "name": "Gemma 3 27B",          "supports_schema": False},
-    {"id": "gemma-3-12b-it",           "name": "Gemma 3 12B",          "supports_schema": False},
+    {"id": "gemini-2.5-flash",         "name": "Gemini 2.5 Flash",     "supports_schema": True,  "supports_vision": True},
+    {"id": "gemini-2.5-flash-lite",    "name": "Gemini 2.5 Flash Lite","supports_schema": True,  "supports_vision": True},
+    {"id": "gemini-3-flash-preview",   "name": "Gemini 3 Flash",       "supports_schema": True,  "supports_vision": True},
+    {"id": "gemma-3-4b-it",            "name": "Gemma 3 4B",           "supports_schema": False, "supports_vision": False},
+    {"id": "gemma-3-27b-it",           "name": "Gemma 3 27B",          "supports_schema": False, "supports_vision": False},
+    {"id": "gemma-3-12b-it",           "name": "Gemma 3 12B",          "supports_schema": False, "supports_vision": False},
+]
+
+# Gemma-first chain for lightweight tasks (intent classification, time parsing)
+# Falls back to Gemini if all Gemma models are rate-limited
+INTENT_MODEL_CHAIN = [
+    {"id": "gemma-3-4b-it",            "name": "Gemma 3 4B",           "supports_schema": False, "supports_vision": False},
+    {"id": "gemma-3-12b-it",           "name": "Gemma 3 12B",          "supports_schema": False, "supports_vision": False},
+    {"id": "gemma-3-27b-it",           "name": "Gemma 3 27B",          "supports_schema": False, "supports_vision": False},
+    {"id": "gemini-2.5-flash-lite",    "name": "Gemini 2.5 Flash Lite","supports_schema": True,  "supports_vision": True},
+    {"id": "gemini-2.5-flash",         "name": "Gemini 2.5 Flash",     "supports_schema": True,  "supports_vision": True},
+]
+
+# Vision-only chain (for image extraction) — Gemma cannot do vision
+VISION_MODEL_CHAIN = [
+    {"id": "gemini-2.5-flash",         "name": "Gemini 2.5 Flash",     "supports_schema": True,  "supports_vision": True},
+    {"id": "gemini-2.5-flash-lite",    "name": "Gemini 2.5 Flash Lite","supports_schema": True,  "supports_vision": True},
+    {"id": "gemini-3-flash-preview",   "name": "Gemini 3 Flash",       "supports_schema": True,  "supports_vision": True},
 ]
 
 _CALENDAR_JSON_TEMPLATE = (
@@ -229,36 +246,29 @@ _CALENDAR_JSON_TEMPLATE = (
 )
 
 
-def _get_ordered_chain():
+def _get_ordered_chain(base_chain=None):
+    if base_chain is None:
+        base_chain = MODEL_CHAIN
     app_config = load_config()
     preferred_id = app_config.get("preferred_model")
-    if not preferred_id:
-        return list(MODEL_CHAIN)
 
-    preferred_idx = None
-    for i, m in enumerate(MODEL_CHAIN):
-        if m["id"] == preferred_id:
-            preferred_idx = i
-            break
+    # Only apply preferred model to the main MODEL_CHAIN, not specialised chains
+    if base_chain is not MODEL_CHAIN or not preferred_id:
+        return list(base_chain)
 
+    preferred_idx = next((i for i, m in enumerate(base_chain) if m["id"] == preferred_id), None)
     if preferred_idx is None:
-        return list(MODEL_CHAIN)
+        return list(base_chain)
 
-    chain = [MODEL_CHAIN[preferred_idx]]
-    for i, m in enumerate(MODEL_CHAIN):
-        if i != preferred_idx:
-            chain.append(m)
+    chain = [base_chain[preferred_idx]]
+    chain += [m for i, m in enumerate(base_chain) if i != preferred_idx]
     return chain
 
 
-async def generate_with_fallback(
-    prompt: str,
-    status_message=None,
-    use_schema: bool = True,
-):
+async def generate_with_fallback(prompt: str, status_message=None, use_schema: bool = True, model_chain=None):
     client = genai.Client()
     last_error = None
-    chain = _get_ordered_chain()
+    chain = _get_ordered_chain(model_chain)
 
     for model_info in chain:
         model_id = model_info["id"]
@@ -299,21 +309,17 @@ async def generate_with_fallback(
 
         except Exception as e:
             last_error = e
-            error_str = str(e)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
                 continue
             raise
 
     raise last_error
 
 
-async def generate_text_with_fallback(
-    prompt: str,
-    status_message=None,
-):
+async def generate_text_with_fallback(prompt: str, status_message=None, model_chain=None):
     client = genai.Client()
     last_error = None
-    chain = _get_ordered_chain()
+    chain = _get_ordered_chain(model_chain)
 
     for model_info in chain:
         model_id = model_info["id"]
@@ -334,8 +340,52 @@ async def generate_text_with_fallback(
 
         except Exception as e:
             last_error = e
-            error_str = str(e)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                continue
+            raise
+
+    raise last_error
+
+
+async def generate_from_image_with_fallback(image_bytes: bytes, prompt: str, status_message=None):
+    """
+    Send an image + text prompt to a vision-capable model.
+    Uses VISION_MODEL_CHAIN (Gemini only — Gemma does not support vision).
+    Image understanding is available on Gemini free tier; images count toward TPM.
+    """
+    client = genai.Client()
+    last_error = None
+
+    b64_data = base64.b64encode(image_bytes).decode()
+
+    for model_info in VISION_MODEL_CHAIN:
+        model_id = model_info["id"]
+        model_name = model_info["name"]
+
+        if status_message:
+            try:
+                await status_message.edit_text(f"⏳ Reading image… ({model_name})")
+            except Exception:
+                pass
+
+        try:
+            response = client.models.generate_content(
+                model=model_id,
+                contents=[
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": b64_data,
+                        }
+                    },
+                    prompt,
+                ],
+            )
+            return response.text.strip(), model_name
+
+        except Exception as e:
+            last_error = e
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
                 continue
             raise
 
@@ -360,51 +410,75 @@ def get_calendar_service():
     return build('calendar', 'v3', credentials=creds)
 
 
+def gcal_day_link(date: datetime.date) -> str:
+    """Return a direct Google Calendar link for a specific day."""
+    return f"{GCAL_URL}/day/{date.year}/{date.month}/{date.day}"
+
+
+def gcal_week_link(date: datetime.date) -> str:
+    """Return a direct Google Calendar link for the week containing the given date."""
+    return f"{GCAL_URL}/week/{date.year}/{date.month}/{date.day}"
+
+
 # ============================================================
-# Intent Detection & Calendar Query
+# Intent Classification (Gemma-first)
 # ============================================================
-QUERY_KEYWORDS = [
-    "what do i have", "what's on", "whats on", "do i have anything",
-    "show me", "list my", "any events", "schedule for", "agenda",
-    "what is scheduled", "am i free", "am i busy", "what time",
-    "remind me what", "tmr", "tomorrow", "today", "this week",
-    "next week", "upcoming", "calendar", "what's happening", "whats happening",
-]
-
-
-def looks_like_query(text: str) -> bool:
-    """Quick heuristic check before calling the LLM."""
-    lowered = text.lower()
-    return any(kw in lowered for kw in QUERY_KEYWORDS)
-
-
 async def classify_intent(user_text: str) -> dict:
     """
-    Ask Gemini to classify the message intent and extract query parameters.
-    Returns dict: { "intent": "query"|"create", "time_min": "...", "time_max": "..." }
+    Use AI (Gemma-first for quota efficiency) to classify message intent.
+
+    Returns one of:
+      {"intent": "query",  "time_min": "...", "time_max": "...", "search_hint": "..."}
+      {"intent": "create"}
+      {"intent": "delete", "search_hint": "...", "time_min": "...", "time_max": "..."}
     """
     current_time = get_sg_time_str()
+    now = get_sg_now()
+    in_30d = (now + timedelta(days=30)).isoformat()
+
     prompt = (
         f"Today is {current_time} (Singapore Time, UTC+8).\n"
-        f"Classify the user's message as either a calendar QUERY (asking about existing events) "
-        f"or a calendar CREATE/UPDATE request (adding/editing an event).\n\n"
+        f"Classify the intent of this message. Reply ONLY with valid JSON, no markdown, no explanation.\n\n"
+        f"Intents:\n"
+        f"- 'query': user is asking about existing calendar events "
+        f"  (e.g. 'when is my badminton', 'what do I have tmr', 'am I free', 'show my schedule')\n"
+        f"- 'create': user wants to add a new event to the calendar\n"
+        f"- 'delete': user wants to delete an event by describing it "
+        f"  (e.g. 'delete my badminton on Friday', 'remove the CS2101 lecture')\n\n"
         f"User message: \"{user_text}\"\n\n"
-        f"Respond with ONLY valid JSON like:\n"
-        f'{{ "intent": "query", "time_min": "YYYY-MM-DDTHH:MM:SS+08:00", "time_max": "YYYY-MM-DDTHH:MM:SS+08:00" }}\n'
-        f"or\n"
-        f'{{ "intent": "create" }}\n\n'
-        f"For queries, set time_min and time_max to cover the relevant period "
-        f"(e.g. for 'tomorrow' use start and end of tomorrow, for 'this week' use Mon–Sun). "
-        f"Always use UTC+8 offset in timestamps."
+        f"JSON format rules:\n"
+        f"- For 'query': include time_min, time_max (ISO 8601 +08:00) and search_hint "
+        f"  (key word or phrase from the message, e.g. 'badminton'). "
+        f"  If no specific date is mentioned, set time_min = now and time_max = 30 days from now "
+        f"  ({in_30d}).\n"
+        f"- For 'create': just {{\"intent\": \"create\"}}\n"
+        f"- For 'delete': include search_hint, time_min, time_max covering the relevant period. "
+        f"  If no specific date, use now to +30 days.\n\n"
+        f"Examples:\n"
+        f"  'when is my badminton' → "
+        f"  {{\"intent\":\"query\",\"time_min\":\"{now.isoformat()}\","
+        f"\"time_max\":\"{in_30d}\",\"search_hint\":\"badminton\"}}\n"
+        f"  'add badminton tmr 5pm 2h' → {{\"intent\":\"create\"}}\n"
+        f"  'delete my badminton on Friday' → "
+        f"  {{\"intent\":\"delete\",\"search_hint\":\"badminton\","
+        f"\"time_min\":\"{now.isoformat()}\",\"time_max\":\"{in_30d}\"}}\n\n"
+        f"Reply with ONLY the JSON object."
     )
-    raw, _ = await generate_text_with_fallback(prompt)
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    return json.loads(raw)
+
+    try:
+        raw, _ = await generate_text_with_fallback(prompt, model_chain=INTENT_MODEL_CHAIN)
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        return json.loads(raw)
+    except Exception as e:
+        print(f"Intent classification failed: {e}, defaulting to create.")
+        return {"intent": "create"}
 
 
+# ============================================================
+# Calendar Query helpers
+# ============================================================
 def fetch_events(time_min: str, time_max: str) -> list:
-    """Fetch events from Google Calendar between time_min and time_max."""
     service = get_calendar_service()
     result = service.events().list(
         calendarId='primary',
@@ -412,32 +486,156 @@ def fetch_events(time_min: str, time_max: str) -> list:
         timeMax=time_max,
         singleEvents=True,
         orderBy='startTime',
-        maxResults=20,
+        maxResults=25,
     ).execute()
     return result.get('items', [])
 
 
-def format_events_for_display(events: list) -> str:
+def find_events_matching(events: list, search_hint: str) -> list:
+    """Filter events by search hint (title, description, location)."""
+    if not search_hint:
+        return events
+    hint = search_hint.lower()
+    matched = [
+        e for e in events
+        if hint in e.get('summary', '').lower()
+        or hint in e.get('description', '').lower()
+        or hint in e.get('location', '').lower()
+    ]
+    return matched if matched else events  # fallback to all if no match
+
+
+def format_events_for_display(events: list, search_hint: str = "", show_gcal_link: bool = True) -> str:
+    """
+    Format events grouped by date.
+    Includes a Google Calendar link for easy navigation.
+    """
     if not events:
-        return "📭 No events found for that period."
+        hint_str = f" matching '{search_hint}'" if search_hint else ""
+        no_events_msg = f"📭 No events found{hint_str} for that period."
+        if show_gcal_link:
+            no_events_msg += f"\n\n[📅 Open Google Calendar]({GCAL_URL})"
+        return no_events_msg
 
-    lines = []
+    sg_tz = timezone(timedelta(hours=8))
+    today = get_sg_now().date()
+    tomorrow = today + timedelta(days=1)
+
+    grouped = defaultdict(list)
     for ev in events:
-        start = ev['start'].get('dateTime', ev['start'].get('date', ''))
+        start_raw = ev['start'].get('dateTime', ev['start'].get('date', ''))
         try:
-            start_display = format_time_for_user(start)
+            dt = datetime.fromisoformat(start_raw).astimezone(sg_tz)
+            grouped[dt.date()].append((dt, ev))
         except Exception:
-            start_display = start
-        title = ev.get('summary', '(No title)')
-        location = ev.get('location', '')
-        loc_str = f"\n  📍 {location}" if location else ""
-        lines.append(f"• *{title}*\n  🕐 {start_display}{loc_str}")
+            grouped[None].append((None, ev))
 
-    return "\n\n".join(lines)
+    total = len(events)
+    hint_str = f" for '{search_hint}'" if search_hint else ""
+    lines = [f"📅 *{total} event{'s' if total != 1 else ''} found{hint_str}:*\n"]
+
+    for date_key in sorted(k for k in grouped if k is not None):
+        if date_key == today:
+            label = "🔵 Today"
+            cal_link = gcal_day_link(date_key)
+        elif date_key == tomorrow:
+            label = "🟢 Tomorrow"
+            cal_link = gcal_day_link(date_key)
+        else:
+            label = date_key.strftime("📆 %A, %d %b")
+            cal_link = gcal_day_link(date_key)
+
+        lines.append(f"*{label}* — [view in calendar]({cal_link})")
+
+        for dt, ev in grouped[date_key]:
+            title = ev.get('summary', '(No title)')
+            end_raw = ev['end'].get('dateTime', ev['end'].get('date', ''))
+            try:
+                end_dt = datetime.fromisoformat(end_raw).astimezone(sg_tz)
+                time_range = (
+                    f"{dt.strftime('%I:%M %p').lstrip('0')} – "
+                    f"{end_dt.strftime('%I:%M %p').lstrip('0')}"
+                )
+            except Exception:
+                time_range = dt.strftime('%I:%M %p').lstrip('0') if dt else "All day"
+            location = ev.get('location', '')
+            loc_str = f"\n    📍 _{location}_" if location else ""
+            lines.append(f"  • *{title}*\n    🕐 {time_range}{loc_str}")
+
+        lines.append("")
+
+    # Unknown date events
+    if None in grouped:
+        lines.append("*Unknown date*")
+        for _, ev in grouped[None]:
+            lines.append(f"  • *{ev.get('summary', '(No title)')}*")
+        lines.append("")
+
+    if show_gcal_link:
+        lines.append(f"[📅 Open Google Calendar]({GCAL_URL})")
+
+    return "\n".join(lines)
 
 
 # ============================================================
-# /model command — interactive model picker
+# Delete by description (no-reply flow)
+# ============================================================
+async def handle_delete_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, intent_data: dict):
+    """Handle delete intent detected by AI (not via reply)."""
+    status = await update.message.reply_text("🔍 Searching for matching events...")
+
+    try:
+        events = fetch_events(intent_data["time_min"], intent_data["time_max"])
+        hint = intent_data.get("search_hint", "")
+        matched = find_events_matching(events, hint)
+
+        if not matched:
+            await status.edit_text(
+                f"📭 No events found matching '{hint}'. Nothing was deleted."
+            )
+            return ConversationHandler.END
+
+        if len(matched) == 1:
+            ev = matched[0]
+            start_raw = ev['start'].get('dateTime', ev['start'].get('date', ''))
+            start_display = format_time_for_user(start_raw)
+            context.user_data['delete_event_id'] = ev['id']
+            keyboard = [[
+                InlineKeyboardButton("🗑️ Yes, delete", callback_data="del_yes"),
+                InlineKeyboardButton("⬅️ No, keep it", callback_data="del_no"),
+            ]]
+            await status.edit_text(
+                f"⚠️ *Delete this event?*\n\n"
+                f"*{ev.get('summary', '(No title)')}*\n"
+                f"🕐 {start_display}",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown',
+            )
+            return UPDATE_REVIEW
+
+        # Multiple matches — let the user pick
+        buttons = []
+        context.user_data['delete_candidates'] = {ev['id']: ev for ev in matched[:8]}
+        for ev in matched[:8]:
+            start_raw = ev['start'].get('dateTime', ev['start'].get('date', ''))
+            start_display = format_time_for_user(start_raw)
+            label = f"{ev.get('summary', '?')} · {start_display}"[:50]
+            buttons.append([InlineKeyboardButton(label, callback_data=f"delsel_{ev['id']}")])
+        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="del_no")])
+
+        await status.edit_text(
+            f"Found {len(matched)} matching events. Which one do you want to delete?",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return UPDATE_REVIEW
+
+    except Exception as e:
+        await status.edit_text(f"❌ Error searching calendar: {e}")
+        return ConversationHandler.END
+
+
+# ============================================================
+# /model command
 # ============================================================
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     app_config = load_config()
@@ -463,8 +661,9 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🤖 *Model Selection*\n\n"
         f"Current: *{current_name}*\n"
-        f"Pick a model to use first. If it hits its rate limit, "
-        f"the bot will automatically fall back through the remaining models.",
+        f"Pick a model to use first for event extraction. If it hits its rate limit, "
+        f"the bot will automatically fall back.\n\n"
+        f"_Note: Intent classification always uses Gemma first to save quota._",
         reply_markup=InlineKeyboardMarkup(rows),
         parse_mode='Markdown',
     )
@@ -474,7 +673,6 @@ async def model_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     action = query.data
-
     app_config = load_config()
 
     if action == "mdl_auto":
@@ -488,12 +686,7 @@ async def model_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if action.startswith("mdl_"):
         chosen_id = action[len("mdl_"):]
-        chosen_name = None
-        for m in MODEL_CHAIN:
-            if m["id"] == chosen_id:
-                chosen_name = m["name"]
-                break
-
+        chosen_name = next((m["name"] for m in MODEL_CHAIN if m["id"] == chosen_id), None)
         if chosen_name:
             app_config["preferred_model"] = chosen_id
             save_config(app_config)
@@ -512,13 +705,17 @@ async def model_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 HELP_TEXT = (
     "📖 *Available Commands*\n\n"
     "• *Send any text* — I'll extract event details and add them to Google Calendar.\n"
-    "• *Ask about your schedule* — e.g. 'what do I have tmr?', 'am I free this week?'\n"
+    "• *Send a photo* — I'll read event details from the image (poster, screenshot, timetable).\n"
+    "• *Ask about your schedule* — e.g. 'what do I have tmr?', 'when is my badminton?'\n"
+    "• *Ask to delete* — e.g. 'delete my badminton on Friday'\n"
     "• *Reply to a confirmed event* with new details — I'll update the event.\n"
-    "• *Reply with* `delete` / `cancel` / `remove` — I'll delete the event.\n\n"
+    "• *Reply with* `delete` / `cancel` / `remove` — I'll delete that event.\n\n"
     "*Commands:*\n"
+    "/today — Show today's events\n"
+    "/week — Show this week's events\n"
     "/help — Show this help message\n"
     "/config — Open settings (reminders, colors, categories)\n"
-    "/model — Choose which AI model to use\n"
+    "/model — Choose which AI model to use for extraction\n"
     "/cancel — Cancel the current action\n"
 )
 
@@ -528,35 +725,132 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# Event Extraction Flow
+# /today and /week shortcut commands
+# ============================================================
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now = get_sg_now()
+    time_min = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    time_max = now.replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
+    try:
+        events = fetch_events(time_min, time_max)
+        reply = format_events_for_display(events, show_gcal_link=True)
+        await update.message.reply_text(reply, parse_mode='Markdown', disable_web_page_preview=True)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Could not fetch calendar: {e}")
+
+
+async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now = get_sg_now()
+    time_min = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    time_max = (now + timedelta(days=7)).replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
+    try:
+        events = fetch_events(time_min, time_max)
+        reply = format_events_for_display(events, show_gcal_link=True)
+        await update.message.reply_text(reply, parse_mode='Markdown', disable_web_page_preview=True)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Could not fetch calendar: {e}")
+
+
+# ============================================================
+# Photo / Image handler
+# ============================================================
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle photos sent to the bot.
+    Uses Gemini vision (free tier supports image understanding — images count toward TPM).
+    Gemma models are NOT used here as they don't support vision input.
+    """
+    status = await update.message.reply_text("🖼️ Reading image…")
+
+    try:
+        photo = update.message.photo[-1]  # highest resolution
+        file = await photo.get_file()
+        image_bytes = await file.download_as_bytearray()
+    except Exception as e:
+        await status.edit_text(f"❌ Could not download image: {e}")
+        return ConversationHandler.END
+
+    app_config = load_config()
+    category_list = ", ".join(f"'{c}'" for c in app_config["colors"].keys())
+    current_time = get_sg_time_str()
+
+    caption = update.message.caption or ""
+    caption_hint = f"\nUser caption: '{caption}'" if caption else ""
+
+    prompt = (
+        f"Today is {current_time} (Singapore Time, UTC+8).{caption_hint}\n"
+        f"Extract all calendar event details visible in this image "
+        f"(e.g. event poster, timetable screenshot, schedule).\n"
+        f"Available categories: {category_list}.\n"
+        f"Pick the most appropriate event_type.\n\n"
+        f"{_CALENDAR_JSON_TEMPLATE}"
+    )
+
+    try:
+        raw_text, model_name = await generate_from_image_with_fallback(
+            bytes(image_bytes), prompt, status_message=status
+        )
+
+        # Parse the JSON from the vision model's text response
+        clean = raw_text
+        if clean.startswith("```"):
+            clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        parsed = json.loads(clean)
+
+        context.user_data['draft_event'] = parsed
+        context.user_data['last_model'] = model_name
+
+        valid_types = set(app_config["colors"].keys())
+        if parsed.get('event_type') not in valid_types:
+            parsed['event_type'] = 'Other'
+
+        await send_draft_menu(status, context)
+        return AWAITING_CONFIRMATION
+
+    except json.JSONDecodeError:
+        await status.edit_text(
+            "❌ Couldn't extract event details from that image.\n"
+            "Make sure the image clearly shows event information like a date, time, or title."
+        )
+        return ConversationHandler.END
+    except Exception as e:
+        await status.edit_text(f"❌ Image processing failed: {e}")
+        return ConversationHandler.END
+
+
+# ============================================================
+# Main text extraction flow
 # ============================================================
 async def start_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.reply_to_message:
         return await handle_update_reply(update, context)
 
     user_text = update.message.text
-    status_message = await update.message.reply_text("⏳ Thinking...")
+    status_message = await update.message.reply_text("⏳ Thinking…")
 
-    # --- Route: query vs. create ---
-    try:
-        if looks_like_query(user_text):
-            intent_data = await classify_intent(user_text)
-        else:
-            intent_data = {"intent": "create"}
-    except Exception as e:
-        print(f"Intent classification failed: {e}, defaulting to create.")
-        intent_data = {"intent": "create"}
+    # Always use AI for intent — no keyword heuristics
+    intent_data = await classify_intent(user_text)
+    intent = intent_data.get("intent", "create")
 
-    if intent_data.get("intent") == "query":
+    # --- Query flow ---
+    if intent == "query":
         try:
             events = fetch_events(intent_data["time_min"], intent_data["time_max"])
-            reply = format_events_for_display(events)
-            await status_message.edit_text(reply, parse_mode='Markdown')
+            hint = intent_data.get("search_hint", "")
+            if hint:
+                events = find_events_matching(events, hint)
+            reply = format_events_for_display(events, search_hint=hint, show_gcal_link=True)
+            await status_message.edit_text(reply, parse_mode='Markdown', disable_web_page_preview=True)
         except Exception as e:
             await status_message.edit_text(f"❌ Could not fetch calendar: {e}")
         return ConversationHandler.END
 
-    # --- Original creation flow ---
+    # --- Delete flow (by description, not reply) ---
+    if intent == "delete":
+        await status_message.delete()
+        return await handle_delete_intent(update, context, intent_data)
+
+    # --- Create flow ---
     app_config = load_config()
     category_list = ", ".join(f"'{c}'" for c in app_config["colors"].keys())
     current_time = get_sg_time_str()
@@ -577,8 +871,8 @@ async def start_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['last_model'] = model_name
 
         valid_types = set(app_config["colors"].keys())
-        if context.user_data['draft_event'].get('event_type') not in valid_types:
-            context.user_data['draft_event']['event_type'] = 'Other'
+        if parsed.get('event_type') not in valid_types:
+            parsed['event_type'] = 'Other'
 
         await send_draft_menu(status_message, context)
         return AWAITING_CONFIRMATION
@@ -687,6 +981,13 @@ async def main_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             start_display = format_time_for_user(event_data['start_time'])
             end_display = format_time_for_user(event_data['end_time'])
 
+            # Deep link to the specific day in Google Calendar
+            try:
+                event_dt = datetime.fromisoformat(event_data['start_time'])
+                day_link = gcal_day_link(event_dt.date())
+            except Exception:
+                day_link = GCAL_URL
+
             success_msg = (
                 f"✅ *Event Successfully Added!*\n\n"
                 f"*Title:* {event_data['summary']}\n"
@@ -694,7 +995,8 @@ async def main_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"*Location:* {event_data.get('location') or 'N/A'}\n"
                 f"*Starts:* {start_display}\n"
                 f"*Ends:* {end_display}\n\n"
-                f"[🗓️ View on Google Calendar]({created.get('htmlLink')})\n\n"
+                f"[🗓️ View event]({created.get('htmlLink')}) · "
+                f"[📅 View day]({day_link})\n\n"
                 f"_💡 Reply to this message with 'delete' to remove it, or with new details to update it._"
             )
             await query.edit_message_text(
@@ -767,7 +1069,9 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Convert this to ISO 8601 format (YYYY-MM-DDTHH:MM:SS+08:00): '{new_value}'. "
                 f"Reply with ONLY the ISO 8601 string and nothing else."
             )
-            resp_text, _ = await generate_text_with_fallback(prompt, status_message=status)
+            resp_text, _ = await generate_text_with_fallback(
+                prompt, status_message=status, model_chain=INTENT_MODEL_CHAIN
+            )
             parsed = resp_text.strip().strip('"').strip("'")
             datetime.fromisoformat(parsed)
             context.user_data['draft_event'][field] = parsed
@@ -779,7 +1083,6 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['draft_event'][field] = new_value
 
     context.user_data.pop('editing_field', None)
-
     status_msg = await update.message.reply_text("🔄 Updating draft…")
     await send_draft_menu(status_msg, context)
     return AWAITING_CONFIRMATION
@@ -799,12 +1102,10 @@ async def handle_update_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
     new_instructions = update.message.text.strip()
 
     if new_instructions.lower() in ('delete', 'cancel', 'remove'):
-        keyboard = [
-            [
-                InlineKeyboardButton("🗑️ Yes, delete", callback_data="del_yes"),
-                InlineKeyboardButton("⬅️ No, keep it", callback_data="del_no"),
-            ]
-        ]
+        keyboard = [[
+            InlineKeyboardButton("🗑️ Yes, delete", callback_data="del_yes"),
+            InlineKeyboardButton("⬅️ No, keep it", callback_data="del_no"),
+        ]]
         context.user_data['delete_event_id'] = google_event_id
         await update.message.reply_text(
             "⚠️ *Are you sure you want to delete this event?*",
@@ -813,7 +1114,6 @@ async def handle_update_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return UPDATE_REVIEW
 
-    # --- Update with review ---
     status_message = await update.message.reply_text("⏳ Fetching and updating the event…")
     try:
         service = get_calendar_service()
@@ -888,10 +1188,30 @@ async def update_review_handler(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data.clear()
         return ConversationHandler.END
 
+    # Multiple-match delete selection
+    if action.startswith("delsel_"):
+        event_id = action[len("delsel_"):]
+        context.user_data['delete_event_id'] = event_id
+        candidates = context.user_data.get('delete_candidates', {})
+        ev = candidates.get(event_id, {})
+        start_raw = ev.get('start', {}).get('dateTime', ev.get('start', {}).get('date', ''))
+        start_display = format_time_for_user(start_raw)
+        keyboard = [[
+            InlineKeyboardButton("🗑️ Yes, delete", callback_data="del_yes"),
+            InlineKeyboardButton("⬅️ No, keep it", callback_data="del_no"),
+        ]]
+        await query.edit_message_text(
+            f"⚠️ *Delete this event?*\n\n"
+            f"*{ev.get('summary', '(No title)')}*\n"
+            f"🕐 {start_display}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown',
+        )
+        return UPDATE_REVIEW
+
     if action == "upd_confirm":
         event_id = context.user_data.get('update_event_id')
         updated_data = context.user_data.get('draft_event', {})
-        replied_msg_id = context.user_data.get('update_replied_msg_id')
 
         app_config = load_config()
         e_type = updated_data.get('event_type', 'Other')
@@ -916,6 +1236,12 @@ async def update_review_handler(update: Update, context: ContextTypes.DEFAULT_TY
             start_display = format_time_for_user(updated_data['start_time'])
             end_display = format_time_for_user(updated_data['end_time'])
 
+            try:
+                event_dt = datetime.fromisoformat(updated_data['start_time'])
+                day_link = gcal_day_link(event_dt.date())
+            except Exception:
+                day_link = GCAL_URL
+
             msg = (
                 f"✅ *Event Updated!*\n\n"
                 f"*Title:* {updated_data['summary']}\n"
@@ -923,7 +1249,7 @@ async def update_review_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 f"*Location:* {updated_data.get('location') or 'N/A'}\n"
                 f"*Starts:* {start_display}\n"
                 f"*Ends:* {end_display}\n\n"
-                f"[🗓️ View on Google Calendar]({patched.get('htmlLink')})\n\n"
+                f"[🗓️ View event]({patched.get('htmlLink')}) · [📅 View day]({day_link})\n\n"
                 f"_💡 Reply to this message to update or delete it again._"
             )
             await query.edit_message_text(
@@ -948,12 +1274,10 @@ async def update_review_handler(update: Update, context: ContextTypes.DEFAULT_TY
 # ============================================================
 def _build_config_keyboard(app_config):
     c = app_config['colors']
-    rows = [
-        [InlineKeyboardButton(
-            f"⏰ Reminders: {app_config['reminder_minutes']} min",
-            callback_data="cfg_reminders",
-        )],
-    ]
+    rows = [[InlineKeyboardButton(
+        f"⏰ Reminders: {app_config['reminder_minutes']} min",
+        callback_data="cfg_reminders",
+    )]]
     for cat_name, color_id in c.items():
         color_label = COLOR_NAMES.get(color_id, f"ID {color_id}")
         rows.append([InlineKeyboardButton(
@@ -970,9 +1294,8 @@ def _build_config_keyboard(app_config):
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     app_config = load_config()
-    msg = "⚙️ *Bot Settings*\nTap a button to modify it:"
     await update.message.reply_text(
-        msg,
+        "⚙️ *Bot Settings*\nTap a button to modify it:",
         reply_markup=_build_config_keyboard(app_config),
         parse_mode='Markdown',
     )
@@ -981,9 +1304,8 @@ async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _show_config_menu(query, context):
     app_config = load_config()
-    msg = "⚙️ *Bot Settings*\nTap a button to modify it:"
     await query.edit_message_text(
-        msg,
+        "⚙️ *Bot Settings*\nTap a button to modify it:",
         reply_markup=_build_config_keyboard(app_config),
         parse_mode='Markdown',
     )
@@ -1050,7 +1372,6 @@ async def config_button_handler(update: Update, context: ContextTypes.DEFAULT_TY
     return CHOOSING_SETTING
 
 
-# --- Interactive Color Picker ---
 async def _show_color_picker(query, evt_type):
     buttons = [
         InlineKeyboardButton(COLOR_SHORT[cid], callback_data=f"pickclr_{cid}")
@@ -1058,7 +1379,6 @@ async def _show_color_picker(query, evt_type):
     ]
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="cfg_back")])
-
     await query.edit_message_text(
         f"Pick a color for *{evt_type}*:",
         reply_markup=InlineKeyboardMarkup(rows),
@@ -1078,12 +1398,10 @@ async def color_pick_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if action.startswith("pickclr_"):
         color_id = action[len("pickclr_"):]
         evt_type = context.user_data.get('cfg_color_target')
-
         app_config = load_config()
         if evt_type and evt_type in app_config['colors']:
             app_config['colors'][evt_type] = color_id
             save_config(app_config)
-
         context.user_data.pop('cfg_color_target', None)
         await query.answer(f"✅ {evt_type} → {COLOR_NAMES.get(color_id, color_id)}", show_alert=True)
         return await _show_config_menu(query, context)
@@ -1091,7 +1409,6 @@ async def color_pick_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return CHOOSING_COLOR
 
 
-# --- Add / Remove Category ---
 async def handle_add_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     if not name or len(name) > 30:
@@ -1105,7 +1422,6 @@ async def handle_add_category(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     app_config['colors'][name] = "1"
     save_config(app_config)
-
     await update.message.reply_text(
         f"✅ Category *{name}* added (default color: {COLOR_NAMES['1']}).\n"
         f"Use /config to change its color.",
@@ -1131,13 +1447,11 @@ async def confirm_delete_category(update: Update, context: ContextTypes.DEFAULT_
             await query.answer(f"🗑️ '{cat_name}' removed.", show_alert=True)
         else:
             await query.answer("Cannot remove that category.", show_alert=True)
-
         return await _show_config_menu(query, context)
 
     return CHOOSING_SETTING
 
 
-# --- Reminder text input ---
 async def handle_config_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip()
     cfg_key = context.user_data.get('cfg_key')
@@ -1182,6 +1496,7 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("config", config_command, filters=user_filter),
+            MessageHandler(filters.PHOTO & user_filter, handle_photo),
             MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, start_extraction),
         ],
         states={
@@ -1192,7 +1507,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, handle_edit_input),
             ],
             UPDATE_REVIEW: [
-                CallbackQueryHandler(update_review_handler, pattern="^(upd_|del_)"),
+                CallbackQueryHandler(update_review_handler, pattern="^(upd_|del_|delsel_)"),
             ],
             CHOOSING_SETTING: [
                 CallbackQueryHandler(config_button_handler, pattern="^cfg_"),
@@ -1219,10 +1534,11 @@ def main():
 
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("help", help_command, filters=user_filter))
+    app.add_handler(CommandHandler("today", today_command, filters=user_filter))
+    app.add_handler(CommandHandler("week", week_command, filters=user_filter))
     app.add_handler(CommandHandler("model", model_command, filters=user_filter))
     app.add_handler(CallbackQueryHandler(model_button_handler, pattern="^mdl_"))
 
-    # --- Webhook vs Polling Logic ---
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     PORT = int(os.getenv("PORT", "10000"))
 
@@ -1249,22 +1565,18 @@ def main():
                     await app.process_update(update)
                     return Response(status_code=200)
 
-                starlette_app = Starlette(
-                    routes=[
-                        Route("/", health),
-                        Route("/health", health),
-                        Route("/webhook", telegram_webhook, methods=["POST"]),
-                    ]
-                )
+                starlette_app = Starlette(routes=[
+                    Route("/", health),
+                    Route("/health", health),
+                    Route("/webhook", telegram_webhook, methods=["POST"]),
+                ])
 
-                webserver = uvicorn.Server(
-                    config=uvicorn.Config(
-                        app=starlette_app,
-                        host="0.0.0.0",
-                        port=PORT,
-                        log_level="info",
-                    )
-                )
+                webserver = uvicorn.Server(config=uvicorn.Config(
+                    app=starlette_app,
+                    host="0.0.0.0",
+                    port=PORT,
+                    log_level="info",
+                ))
 
                 await webserver.serve()
                 await app.stop()
